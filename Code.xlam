@@ -1,0 +1,265 @@
+Option Explicit
+
+' Salesforce Session Variables
+Public salesforceAccessToken As String
+Public salesforceInstanceUrl As String
+
+' Salesforce Connected App Credentials
+Private Const SALESFORCE_CONSUMER_KEY As String = "YOUR_SECRET_KEY"
+Private Const SALESFORCE_CONSUMER_SECRET As String = "YOUR_SECRET_CONSUMER"
+
+'---------------------------------------------------------------------------------------------------
+' PUBLIC SUBROUTINES CALLED FROM RIBBONX
+'---------------------------------------------------------------------------------------------------
+
+' RibbonX onAction for the Login / Logout button
+Sub Salesforce_Login(ByVal control As IRibbonControl)
+If salesforceAccessToken <> "" Then
+Call Logout
+Else
+Call Login
+End If
+End Sub
+
+' RibbonX onAction for the Create Quote button
+Sub Salesforce_CreateQuoteFromOpportunity(ByVal control As IRibbonControl)
+If salesforceAccessToken = "" Then
+MsgBox "You must be logged in to create a quote.", vbExclamation, "Session Required"
+Exit Sub
+End If
+
+Call CreateQuote
+
+End Sub
+
+'---------------------------------------------------------------------------------------------------
+' PRIVATE HELPER FUNCTIONS
+'---------------------------------------------------------------------------------------------------
+
+' Handles the login process to Salesforce using the username-password flow.
+Private Sub Login()
+Dim username As String
+Dim password As String
+Dim securityToken As String
+Dim loginUrl As String
+Dim requestBody As String
+Dim http As Object
+
+' Prompt user for credentials
+loginUrl = InputBox("Enter your Salesforce Login URL (e.g., https://MyDomain.my.salesforce.com):", "Salesforce Login URL")
+If loginUrl = "" Then Exit Sub
+
+username = InputBox("Enter your Salesforce username:", "Salesforce Login")
+If username = "" Then Exit Sub
+
+password = InputBox("Enter your Salesforce password:", "Salesforce Login")
+If password = "" Then Exit Sub
+
+securityToken = InputBox("Enter your Salesforce Security Token:", "Salesforce Login")
+If securityToken = "" Then Exit Sub
+
+' Concatenate password and security token
+Dim combinedPassword As String
+combinedPassword = password & securityToken
+
+' Build the request body for the OAuth 2.0 flow
+requestBody = "grant_type=password" & _
+              "&client_id=" & SALESFORCE_CONSUMER_KEY & _
+              "&client_secret=" & SALESFORCE_CONSUMER_SECRET & _
+              "&username=" & username & _
+              "&password=" & combinedPassword
+
+' Make the HTTP POST request
+Set http = CreateObject("MSXML2.XMLHTTP.6.0")
+
+On Error GoTo LoginErrorHandler ' Added error handling for the Open method
+http.Open "POST", loginUrl & "/services/oauth2/token", False
+On Error GoTo 0 ' Reset error handler
+
+http.setRequestHeader "Content-Type", "application/x-www-form-urlencoded"
+http.send requestBody
+
+' Parse the JSON response
+If http.Status = 200 Then
+    Dim jsonResponse As Object
+    Set jsonResponse = ParseJSON(http.responseText)
+    
+    If Not jsonResponse Is Nothing And Not IsEmpty(jsonResponse("access_token")) Then
+        salesforceAccessToken = jsonResponse("access_token")
+        salesforceInstanceUrl = loginUrl
+        MsgBox "Successfully logged in to Salesforce!", vbInformation, "Login Success"
+    Else
+        MsgBox "Failed to parse API response. Please check your credentials.", vbCritical, "Login Failed"
+        salesforceAccessToken = ""
+        salesforceInstanceUrl = ""
+    End If
+Else
+    Dim errorMessage As String
+    errorMessage = "Login failed. HTTP Status: " & http.Status & " - " & http.statusText
+    
+    If InStr(http.responseText, "invalid_grant") > 0 Then
+        errorMessage = errorMessage & vbCrLf & vbCrLf & "Reason: Invalid username, password, or security token."
+    End If
+    
+    MsgBox errorMessage, vbCritical, "Login Failed"
+    salesforceAccessToken = ""
+    salesforceInstanceUrl = ""
+End If
+
+Set http = Nothing
+Exit Sub ' Exit the subroutine to avoid the error handler
+
+LoginErrorHandler:
+MsgBox "An error occurred while trying to connect to Salesforce." & vbCrLf & vbCrLf & _
+"Possible causes:" & vbCrLf & _
+"- Your firewall or proxy is blocking the request." & vbCrLf & _
+"- There is a typo in the login URL." & vbCrLf & _
+"- You are not connected to the internet." & vbCrLf & vbCrLf & _
+"Error: " & Err.Description, vbCritical, "Connection Error"
+Set http = Nothing
+End Sub
+
+' Handles logging out by clearing session variables.
+Private Sub Logout()
+salesforceAccessToken = ""
+salesforceInstanceUrl = ""
+MsgBox "Logged out of Salesforce.", vbInformation, "Logout Success"
+End Sub
+
+' Handles creating a new Quote from opportunities listed in the active worksheet (Sheet1).
+Private Sub CreateQuote()
+Dim ws As Worksheet
+Dim lastRow As Long
+Dim i As Long
+Dim oppId As String
+Dim oppName As String
+Dim requestBody As String
+Dim http As Object
+Dim jsonResponse As Object
+
+Set ws = ThisWorkbook.Sheets("Sheet1")
+lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+
+If lastRow < 2 Then
+    MsgBox "No opportunity data found in Sheet1. Please ensure your data starts in row 2.", vbExclamation, "No Data Found"
+    Exit Sub
+End If
+
+' Use a collection to store the opportunity data
+Dim opportunityList As Object
+Set opportunityList = CreateObject("Scripting.Dictionary")
+
+' Build the collection of Opportunity IDs and Names from the sheet
+For i = 2 To lastRow
+    oppId = ws.Cells(i, 1).Value ' Column A for Opportunity ID
+    oppName = ws.Cells(i, 2).Value ' Column B for Opportunity Name
+    
+    If oppId <> "" Then
+        opportunityList.Add oppId, oppName
+    End If
+Next i
+
+If opportunityList.Count = 0 Then
+    MsgBox "No valid Opportunity IDs found in the sheet.", vbExclamation, "No IDs Found"
+    Exit Sub
+End If
+
+' Build the JSON request body
+Dim jsonArray As String
+jsonArray = "["
+Dim keys As Variant
+keys = opportunityList.keys
+
+For i = 0 To opportunityList.Count - 1
+    Dim currentOppId As String
+    Dim currentOppName As String
+    
+    currentOppId = keys(i)
+    currentOppName = opportunityList.Item(currentOppId)
+    
+    jsonArray = jsonArray & "{""OpportunityId"": """ & currentOppId & """, ""Name"": """ & "Quote for " & currentOppName & """}"
+    
+    If i < opportunityList.Count - 1 Then
+        jsonArray = jsonArray & ","
+    End If
+Next i
+jsonArray = jsonArray & "]"
+
+' Make the HTTP POST request to the Apex RestResource
+Set http = CreateObject("MSXML2.XMLHTTP")
+
+On Error GoTo ApiErrorHandler
+http.Open "POST", salesforceInstanceUrl & "/services/apexrest/createQuotes", False
+http.setRequestHeader "Content-Type", "application/json"
+http.setRequestHeader "Authorization", "Bearer " & salesforceAccessToken
+http.send jsonArray
+On Error GoTo 0 ' Reset error handler
+
+' Check the response
+If http.Status = 201 Then ' 201 Created
+    Set jsonResponse = ParseJSON(http.responseText)
+    
+    ' Check if the response is a dictionary and contains an "ids" key
+    If Not jsonResponse Is Nothing And Not IsEmpty(jsonResponse("ids")) Then
+        Dim newQuoteIds As Variant
+        newQuoteIds = Split(jsonResponse("ids"), ",") ' Assuming the Apex returns a comma-separated list of IDs
+        
+        ' This part is a placeholder. You'll need to adapt it based on what your Apex returns.
+        ' It might be a list of objects with ID and success/failure.
+        ' For simplicity, we assume a single comma-separated string of new IDs.
+        For i = 0 To UBound(newQuoteIds)
+            ' This is where you would match the returned ID to the original row
+            ' You'll need a more robust mapping if the order isn't guaranteed
+            ws.Cells(i + 2, 3).Value = Trim(newQuoteIds(i)) ' Column C for new Quote ID
+        Next i
+    End If
+    
+    MsgBox "Quote creation process complete! New IDs have been written to the sheet.", vbInformation, "Process Complete"
+    
+Else
+    MsgBox "Failed to create Quotes. Status: " & http.Status & " - " & http.statusText & vbCrLf & _
+           "Response: " & http.responseText, vbCritical, "API Error"
+End If
+
+Set http = Nothing
+Exit Sub
+
+ApiErrorHandler:
+MsgBox "An error occurred during the API call." & vbCrLf & "Error: " & Err.Description, vbCritical, "API Error"
+Set http = Nothing
+End Sub
+
+' A simple JSON parser. This is a basic implementation and will not handle complex nested JSON.
+Private Function ParseJSON(ByVal jsonString As String) As Object
+Set ParseJSON = Nothing
+On Error GoTo ErrorHandler
+
+Dim jsonDictionary As Object
+Set jsonDictionary = CreateObject("Scripting.Dictionary")
+
+' Clean up the string for simple parsing
+jsonString = Replace(jsonString, "{", "")
+jsonString = Replace(jsonString, "}", "")
+jsonString = Replace(jsonString, """", "")
+
+Dim keyValuePairs As Variant
+keyValuePairs = Split(jsonString, ",")
+
+Dim pair As Variant
+Dim parts As Variant
+
+For Each pair In keyValuePairs
+    parts = Split(pair, ":")
+    If UBound(parts) = 1 Then
+        jsonDictionary.Add Trim(parts(0)), Trim(parts(1))
+    End If
+Next pair
+
+Set ParseJSON = jsonDictionary
+Exit Function
+
+ErrorHandler:
+MsgBox "Error parsing JSON response. Response may be malformed." & vbCrLf & "Response: " & jsonString, vbCritical, "JSON Parse Error"
+Exit Function
+End Function
+
